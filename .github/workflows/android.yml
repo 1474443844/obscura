@@ -198,19 +198,42 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-v8-android-137-${{ matrix.target }}-
 
+      - name: Ensure build scripts
+        # Checked-out source may be an older tag that predates the Android
+        # build scripts. Pull them from the commit that owns this workflow
+        # (github.sha = the branch selected in "Run workflow").
+        run: |
+          set -euo pipefail
+          mkdir -p scripts
+          REPO="${{ github.repository }}"
+          SHA="${{ github.sha }}"
+          fetch_if_missing() {
+            local path="$1"
+            if [[ -f "$path" ]]; then
+              echo "present: $path"
+              return 0
+            fi
+            echo "missing $path — fetching from ${REPO}@${SHA}"
+            curl -fsSL "https://raw.githubusercontent.com/${REPO}/${SHA}/${path}" -o "$path"
+          }
+          fetch_if_missing scripts/build-android.sh
+          fetch_if_missing scripts/build-android-arm64.sh || true
+          chmod +x scripts/build-android.sh
+          [[ -f scripts/build-android-arm64.sh ]] && chmod +x scripts/build-android-arm64.sh
+          ls -la scripts/
+
       - name: Build
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
           ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
-          chmod +x scripts/build-android.sh
-          # Prefer new script; fall back if an old tag only has the arm64 script.
-          if [[ -x scripts/build-android.sh ]]; then
-            scripts/build-android.sh
-          elif [[ -x scripts/build-android-arm64.sh ]]; then
-            scripts/build-android-arm64.sh
+          set -euo pipefail
+          if [[ -f scripts/build-android.sh ]]; then
+            bash scripts/build-android.sh
+          elif [[ -f scripts/build-android-arm64.sh ]]; then
+            bash scripts/build-android-arm64.sh
           else
-            echo "No android build script in this ref" >&2
+            echo "No android build script available (not in source tree, and not on ${{ github.sha }})" >&2
             exit 1
           fi
 
