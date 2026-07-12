@@ -1,0 +1,179 @@
+name: Android Release Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_tag:
+        description: Source tag to build and release
+        required: true
+        type: string
+      arm64_v8a:
+        description: Build arm64-v8a
+        required: false
+        type: boolean
+        default: true
+      x86_64:
+        description: Build x86_64
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  build-arm64-v8a:
+    if: ${{ inputs.arm64_v8a }}
+    runs-on: ubuntu-22.04
+
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target-android
+      CARGO_BUILD_JOBS: 2
+      NINJAFLAGS: -j2
+      RUST_BACKTRACE: 1
+      CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: /tmp/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android28-clang
+      CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER: /tmp/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/x86_64-linux-android28-clang
+
+    steps:
+      - name: Checkout source tag
+        uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ inputs.source_tag }}
+
+      - name: Install host deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libglib2.0-dev curl unzip xz-utils python3
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Restore cargo cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target-android
+
+      - name: Download Android NDK
+        run: |
+          curl -L --retry 3 -o /tmp/android-ndk.zip https://dl.google.com/android/repository/android-ndk-r27d-linux.zip
+          rm -rf /tmp/android-ndk
+          unzip -q /tmp/android-ndk.zip -d /tmp
+          mv /tmp/android-ndk-r27d /tmp/android-ndk
+          echo "ANDROID_NDK_HOME=/tmp/android-ndk" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=/tmp/android-ndk" >> "$GITHUB_ENV"
+          echo "/tmp/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
+
+      - name: Patch cross-build bootstrap
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('crates/obscura-js/build.rs')
+          text = p.read_text()
+          if 'cargo:rustc-check-cfg=cfg(obscura_runtime_bootstrap)' not in text:
+              text = text.replace('    println!("cargo:rerun-if-changed=build.rs");\n', '    println!("cargo:rerun-if-changed=build.rs");\n    println!("cargo:rustc-check-cfg=cfg(obscura_runtime_bootstrap)");\n')
+          if 'target_os == "android"' not in text:
+              text = text.replace('  // Build from source\n  if env_bool("V8_FROM_SOURCE") {\n', '  // Build from source. Android has no prebuilt librusty_v8 archives, so always\n  // compile from source for android targets even when V8_FROM_SOURCE is unset.\n  let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();\n  if env_bool("V8_FROM_SOURCE") || target_os == "android" {\n')
+          p.write_text(text)
+
+          p = Path('crates/obscura-js/src/runtime.rs')
+          text = p.read_text()
+          if 'cfg(obscura_runtime_bootstrap)' not in text:
+              text = text.replace('static SNAPSHOT: &[u8] = include_bytes!(env!("OBSCURA_SNAPSHOT_PATH"));\n', '''// Host-native builds bake a V8 startup snapshot at compile time. Cross-builds\n// skip it because snapshots are architecture-specific.\n#[cfg(not(obscura_runtime_bootstrap))]\nstatic SNAPSHOT: &[u8] = include_bytes!(env!("OBSCURA_SNAPSHOT_PATH"));\n\n#[cfg(obscura_runtime_bootstrap)]\nconst BOOTSTRAP_JS: &str = include_str!("../js/bootstrap.js");\n''')
+              text = text.replace('        let mut runtime = JsRuntime::new(RuntimeOptions {\n            extensions: vec![build_extension()],\n            module_loader: Some(module_loader),\n            startup_snapshot: Some(SNAPSHOT),\n            ..Default::default()\n        });\n', '''        #[cfg(not(obscura_runtime_bootstrap))]\n        let mut runtime = JsRuntime::new(RuntimeOptions {\n            extensions: vec![build_extension()],\n            module_loader: Some(module_loader),\n            startup_snapshot: Some(SNAPSHOT),\n            ..Default::default()\n        });\n\n        #[cfg(obscura_runtime_bootstrap)]\n        let mut runtime = {\n            let mut rt = JsRuntime::new(RuntimeOptions {\n                extensions: vec![build_extension()],\n                module_loader: Some(module_loader),\n                startup_snapshot: None,\n                ..Default::default()\n            });\n            rt.execute_script("<obscura:bootstrap>", BOOTSTRAP_JS.to_string())\n                .expect("bootstrap.js should not fail at runtime");\n            rt\n        };\n''')
+          p.write_text(text)
+          PY
+
+      - name: Build clear_cache shim
+        run: |
+          cat > /tmp/clear_cache_shim.S <<'EOF'
+          .text
+          .global __clear_cache
+          .type __clear_cache, %function
+          __clear_cache:
+              ret
+          EOF
+          "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android28-clang" -c /tmp/clear_cache_shim.S -o /tmp/clear_cache_shim.o
+
+      - name: Build binaries
+        env:
+          V8_FROM_SOURCE: '1'
+          RUSTFLAGS: -C link-arg=/tmp/clear_cache_shim.o
+        run: |
+          cargo build --release --target aarch64-linux-android --bin obscura --bin obscura-worker
+
+      - name: Package release asset
+        run: |
+          cd target-android/aarch64-linux-android/release
+          tar -czf "obscura-${{ inputs.source_tag }}-arm64-v8a.tar.gz" obscura obscura-worker
+
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.source_tag }}
+          files: target-android/aarch64-linux-android/release/obscura-${{ inputs.source_tag }}-arm64-v8a.tar.gz
+          overwrite_files: true
+
+  build-x86_64:
+    if: ${{ inputs.x86_64 }}
+    runs-on: ubuntu-22.04
+
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target-android
+      CARGO_BUILD_JOBS: 2
+      NINJAFLAGS: -j2
+      RUST_BACKTRACE: 1
+      CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: /tmp/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android28-clang
+      CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER: /tmp/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/x86_64-linux-android28-clang
+
+    steps:
+      - name: Checkout source tag
+        uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ inputs.source_tag }}
+
+      - name: Install host deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libglib2.0-dev curl unzip xz-utils python3
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-linux-android
+
+      - name: Restore cargo cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target-android
+
+      - name: Download Android NDK
+        run: |
+          curl -L --retry 3 -o /tmp/android-ndk.zip https://dl.google.com/android/repository/android-ndk-r27d-linux.zip
+          rm -rf /tmp/android-ndk
+          unzip -q /tmp/android-ndk.zip -d /tmp
+          mv /tmp/android-ndk-r27d /tmp/android-ndk
+          echo "ANDROID_NDK_HOME=/tmp/android-ndk" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=/tmp/android-ndk" >> "$GITHUB_ENV"
+          echo "/tmp/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
+
+      - name: Build binaries
+        env:
+          V8_FROM_SOURCE: '1'
+        run: |
+          cargo build --release --target x86_64-linux-android --bin obscura --bin obscura-worker
+
+      - name: Package release asset
+        run: |
+          cd target-android/x86_64-linux-android/release
+          tar -czf "obscura-${{ inputs.source_tag }}-x86_64.tar.gz" obscura obscura-worker
+
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.source_tag }}
+          files: target-android/x86_64-linux-android/release/obscura-${{ inputs.source_tag }}-x86_64.tar.gz
+          overwrite_files: true
