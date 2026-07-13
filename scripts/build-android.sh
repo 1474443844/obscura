@@ -355,7 +355,7 @@ esac
 unset V8_FROM_SOURCE || true
 
 echo "Building $TARGET ($ABI_NAME, API $API_LEVEL) ..."
-cargo build --release --target "$TARGET" --bin obscura --bin obscura-worker
+cargo build --release --target "$TARGET" --bin obscura --bin obscura-worker --features stealth
 
 OUT="${CARGO_TARGET_DIR:-$ROOT/target}/${TARGET}/release"
 echo "Built ($ABI_NAME):"
